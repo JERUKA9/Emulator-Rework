@@ -1,0 +1,6 @@
+1.Core Emulation.
+2.Pack and Unpack archive.
+3.PPU
+4.Apu
+5.Mappers
+6.Keybord and Joystick support.
