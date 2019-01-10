@@ -1,0 +1,1157 @@
+#include<stdio.h>
+#include<iostream>
+
+X6502 X;
+
+#ifdef I
+main (*X6502_Run)(int32 cycles);
+#endif
+
+'Uint32' timestamp;
+main FP_FASTAPASS(1) (*MapIRQHook)(int a);
+
+#define _PC        X.PC
+#define _A         X.A
+#define _X         X.X
+#define _Y         X.Y
+#define _S         X.S
+#define _P         X.P
+#define _PI        X.mooPI
+#define _DB        X.DB
+#define _count     X.count
+#define _tcount    X.tcount
+#define _IRQlow    X.IRQlow
+#define _jammed    X.jammed
+
+#define ADDCYC(x) {									\
+	int __x = x;									\
+	_tcount += __x;									\
+	_count -= __x * 48;								\
+	timestamp += __x;								\
+}
+
+static INLINE Uint8 RdMemNorm(Uint32 A) {
+	return(_DB = ARead[A](A));
+}
+
+static INLINE main WrMemNorm(Uint32 A, uint8 V) {
+	BWrite[A](A, V);
+}
+
+#ifdef CPU_EMULATION
+
+
+static INLINE uint8 RdMemHook(Uint32 A) {
+	if (X.ReadHook)
+		return(_DB = X.ReadHook(&X, A));
+	else
+		return(_DB = ARead[A](A));
+}
+
+static INLINE main WrMemHook(Uint32 A, uint8 V) {
+	if (X.WriteHook)
+		X.WriteHook(&X, A, V);
+	else
+		BWrite[A](A, V);
+}
+#endif
+
+static INLINE uint8 RdRAMFast(Uint32 A) {
+	return(_DB = RAM[A]);
+}
+
+static INLINE main WrRAMFast(Uint32 A, uint8 V) {
+	RAM[A] = V;
+}
+
+uint8 FASTAPASS(1) X6502_DMR(Uint32 A) {
+	ADDCYC(1);
+	return(X.DB = ARead[A](A));
+}
+
+main FASTAPASS(2) X6502_DMW(Uint32 A, uint8 V) {
+	ADDCYC(1);
+	BWrite[A](A, V);
+}
+
+#define PUSH(V) {									\
+	uint8 VTMP = V;									\
+	WrRAM(0x100 + _S, VTMP);						\
+	_S--;											\
+}
+
+#define POP() RdRAM(0x100 + (++_S))
+
+static uint8 ZNTable[256];
+// Some of these operations will only make sense if you know what the flag constants are.
+
+#define X_ZN(zort)  _P &= ~(Z_FLAG | N_FLAG); _P |= ZNTable[zort]
+#define X_ZNT(zort) _P |= ZNTable[zort]
+
+#define JR(cond) {									\
+	if (cond)										\
+	{												\
+		Uint32 tmp;									\
+		int32 disp;									\
+		disp = (int8)RdMem(_PC);					\
+		_PC++;										\
+		ADDCYC(1);									\
+		tmp = _PC;									\
+		_PC += disp;								\
+		if ((tmp ^ _PC) & 0x100)					\
+			ADDCYC(1);								\
+	} else _PC++;									\
+}
+
+#define LDA     _A = x; X_ZN(_A)
+#define LDX     _X = x; X_ZN(_X)
+#define LDY     _Y = x; X_ZN(_Y)
+
+// All of the freaky arithmetic operations.
+#define AND     _A &= x; X_ZN(_A)
+#define BIT     _P &= ~(Z_FLAG | V_FLAG | N_FLAG); _P |= ZNTable[x & _A] & Z_FLAG; _P |= x & (V_FLAG | N_FLAG)
+#define EOR     _A ^= x; X_ZN(_A)
+#define ORA     _A |= x; X_ZN(_A)
+
+#define ADC {										\
+	Uint32 l = _A + x + (_P & 1);					\
+	_P &= ~(Z_FLAG | C_FLAG | N_FLAG | V_FLAG);		\
+	_P |= ((((_A ^ x) & 0x80) ^ 0x80) & ((_A ^ l) & 0x80)) >> 1;  \
+	_P |= (l >> 8) & C_FLAG;						\
+	_A = l;											\
+	X_ZNT(_A);										\
+}
+
+#define SBC {										\
+	Uint32 l = _A - x - ((_P & 1) ^ 1);				\
+	_P &= ~(Z_FLAG | C_FLAG | N_FLAG | V_FLAG);		\
+	_P |= ((_A ^ l) & (_A ^ x) & 0x80) >> 1;		\
+	_P |= ((l >> 8) & C_FLAG) ^ C_FLAG;				\
+	_A = l;											\
+	X_ZNT(_A);										\
+}
+
+#define CMPL(a1, a2) {								\
+	Uint32 t = a1 - a2;								\
+	X_ZN(t & 0xFF);									\
+	_P &= ~C_FLAG;									\
+	_P |= ((t >> 8) & C_FLAG) ^ C_FLAG;				\
+}
+
+// Special undocumented operation.  Very similar to CMP.
+#define AXS {										\
+	Uint32 t = (_A & _X) - x;						\
+	X_ZN(t & 0xFF);									\
+	_P &= ~C_FLAG;									\
+	_P |= ((t >> 8) & C_FLAG) ^ C_FLAG;				\
+	_X = t;											\
+}
+
+#define CMP     CMPL(_A, x)
+#define CPX     CMPL(_X, x)
+#define CPY     CMPL(_Y, x)
+
+// The following operations modify the byte being worked on.
+#define DEC     x--; X_ZN(x)
+#define INC     x++; X_ZN(x)
+
+#define ASL     _P &= ~C_FLAG; _P |= x >> 7; x <<= 1; X_ZN(x)
+#define LSR     _P &= ~(C_FLAG | N_FLAG | Z_FLAG); _P |= x & 1; x >>= 1; X_ZNT(x)
+
+// For undocumented instructions, maybe for other things later...
+#define LSRA    _P &= ~(C_FLAG | N_FLAG | Z_FLAG); _P |= _A & 1; _A >>= 1; X_ZNT(_A)
+
+#define ROL {										\
+	uint8 l = x >> 7;								\
+	x <<= 1;										\
+	x |= _P & C_FLAG;								\
+	_P &= ~(Z_FLAG | N_FLAG | C_FLAG);				\
+	_P |= l;										\
+	X_ZNT(x);										\
+}
+
+#define ROR {										\
+	uint8 l = x & 1;								\
+	x >>= 1;										\
+	x |= (_P & C_FLAG) << 7;						\
+	_P &= ~(Z_FLAG | N_FLAG | C_FLAG);				\
+	_P |= l;										\
+	X_ZNT(x);										\
+}
+
+// Icky icky thing for some undocumented instructions.  Can easily be
+// broken if names of local variables are changed.
+
+// Absolute
+#define GetAB(target) {								\
+	target = RdMem(_PC);							\
+	_PC++;											\
+	target |= RdMem(_PC) << 8;						\
+	_PC++;											\
+}
+
+// Absolute Indexed(for reads)
+#define GetABIRD(target, i) {						\
+	Uint32 tmp;										\
+	GetAB(tmp);										\
+	target = tmp;									\
+	target += i;									\
+	if ((target ^ tmp) & 0x100) {					\
+		target &= 0xFFFF;							\
+		RdMem(target ^ 0x100);						\
+		ADDCYC(1);									\
+	}												\
+}
+
+// Absolute Indexed(for writes and rmws)
+#define GetABIWR(target, i) {						\
+	Uint32 rt;										\
+	GetAB(rt);										\
+	target = rt;									\
+	target += i;									\
+	target &= 0xFFFF;								\
+	RdMem((target & 0x00FF) | (rt & 0xFF00));		\
+}
+
+// Zero Page
+#define GetZP(target) {								\
+	target = RdMem(_PC);							\
+	_PC++;											\
+}
+
+// Zero Page Indexed
+#define GetZPI(target, i) {							\
+	target = i + RdMem(_PC);						\
+	_PC++;											\
+}
+
+// Indexed Indirect
+#define GetIX(target) {								\
+	uint8 tmp;										\
+	tmp = RdMem(_PC);								\
+	_PC++;											\
+	tmp += _X;										\
+	target = RdRAM(tmp);							\
+	tmp++;											\
+	target |= RdRAM(tmp) << 8;						\
+}
+
+// Indirect Indexed(for reads)
+#define GetIYRD(target) {							\
+	Uint32 rt;										\
+	uint8 tmp;										\
+	tmp = RdMem(_PC);								\
+	_PC++;											\
+	rt = RdRAM(tmp);								\
+	tmp++;											\
+	rt |= RdRAM(tmp) << 8;							\
+	target = rt;									\
+	target += _Y;									\
+	if ((target ^ rt) & 0x100) {					\
+		target &= 0xFFFF;							\
+		RdMem(target ^ 0x100);						\
+		ADDCYC(1);									\
+	}												\
+}
+
+// Indirect Indexed(for writes and rmws)
+#define GetIYWR(target) {							\
+	Uint32 rt;										\
+	uint8 tmp;										\
+	tmp = RdMem(_PC);								\
+	_PC++;											\
+	rt = RdRAM(tmp);								\
+	tmp++;											\
+	rt |= RdRAM(tmp) << 8;							\
+	target = rt;									\
+	target += _Y;									\
+	target &= 0xFFFF;								\
+	RdMem((target & 0x00FF) | (rt & 0xFF00));		\
+}
+
+/* Now come the macros to wrap up all of the above stuff addressing mode functions
+and operation macros.  Note that operation macros will always operate(redundant
+redundant) on the variable "x".
+*/
+
+#define RMW_A(op)       { uint8 x = _A; op; _A = x; break; }	/* Meh... */
+#define RMW_AB(op)      { Uint32 A; uint8 x; GetAB(A); x = RdMem(A); WrMem(A, x); op; WrMem(A, x); break; }
+#define RMW_ABI(reg, op) { Uint32 A; uint8 x; GetABIWR(A, reg); x = RdMem(A); WrMem(A, x); op; WrMem(A, x); break; }
+#define RMW_ABX(op)     RMW_ABI(_X, op)
+#define RMW_ABY(op)     RMW_ABI(_Y, op)
+#define RMW_IX(op)      { Uint32 A; uint8 x; GetIX(A); x = RdMem(A); WrMem(A, x); op; WrMem(A, x); break; }
+#define RMW_IY(op)      { Uint32 A; uint8 x; GetIYWR(A); x = RdMem(A); WrMem(A, x); op; WrMem(A, x); break; }
+#define RMW_ZP(op)      { uint8 A; uint8 x; GetZP(A); x = RdRAM(A); op; WrRAM(A, x); break; }
+#define RMW_ZPX(op)     { uint8 A; uint8 x; GetZPI(A, _X); x = RdRAM(A); op; WrRAM(A, x); break; }
+
+#define LD_IM(op)       { uint8 x; x = RdMem(_PC); _PC++; op; break; }
+#define LD_ZP(op)       { uint8 A; uint8 x; GetZP(A); x = RdRAM(A); op; break; }
+#define LD_ZPX(op)      { uint8 A; uint8 x; GetZPI(A, _X); x = RdRAM(A); op; break; }
+#define LD_ZPY(op)      { uint8 A; uint8 x; GetZPI(A, _Y); x = RdRAM(A); op; break; }
+#define LD_AB(op)       { Uint32 A; uint8 x; GetAB(A); x = RdMem(A); op; break; }
+#define LD_ABI(reg, op) { Uint32 A; uint8 x; GetABIRD(A, reg); x = RdMem(A); op; break; }
+#define LD_ABX(op)      LD_ABI(_X, op)
+#define LD_ABY(op)      LD_ABI(_Y, op)
+#define LD_IX(op)       { Uint32 A; uint8 x; GetIX(A); x = RdMem(A); op; break; }
+#define LD_IY(op)       { Uint32 A; uint8 x; GetIYRD(A); x = RdMem(A); op; break; }
+
+#define ST_ZP(r)        { uint8 A; GetZP(A); WrRAM(A, r); break; }
+#define ST_ZPX(r)       { uint8 A; GetZPI(A, _X); WrRAM(A, r); break; }
+#define ST_ZPY(r)       { uint8 A; GetZPI(A, _Y); WrRAM(A, r); break; }
+#define ST_AB(r)        { Uint32 A; GetAB(A); WrMem(A, r); break; }
+#define ST_ABI(reg, r)  { Uint32 A; GetABIWR(A, reg); WrMem(A, r); break; }
+#define ST_ABX(r)       ST_ABI(_X, r)
+#define ST_ABY(r)       ST_ABI(_Y, r)
+#define ST_IX(r)        { Uint32 A; GetIX(A); WrMem(A, r); break; }
+#define ST_IY(r)        { Uint32 A; GetIYWR(A); WrMem(A, r); break; }
+
+static uint8 CycTable[256] =
+{
+/*0x00*/ 7, 6, 2, 8, 3, 3, 5, 5, 3, 2, 2, 2, 4, 4, 6, 6,
+/*0x10*/ 2, 5, 2, 8, 4, 4, 6, 6, 2, 4, 2, 7, 4, 4, 7, 7,
+/*0x20*/ 6, 6, 2, 8, 3, 3, 5, 5, 4, 2, 2, 2, 4, 4, 6, 6,
+/*0x30*/ 2, 5, 2, 8, 4, 4, 6, 6, 2, 4, 2, 7, 4, 4, 7, 7,
+/*0x40*/ 6, 6, 2, 8, 3, 3, 5, 5, 3, 2, 2, 2, 3, 4, 6, 6,
+/*0x50*/ 2, 5, 2, 8, 4, 4, 6, 6, 2, 4, 2, 7, 4, 4, 7, 7,
+/*0x60*/ 6, 6, 2, 8, 3, 3, 5, 5, 4, 2, 2, 2, 5, 4, 6, 6,
+/*0x70*/ 2, 5, 2, 8, 4, 4, 6, 6, 2, 4, 2, 7, 4, 4, 7, 7,
+/*0x80*/ 2, 6, 2, 6, 3, 3, 3, 3, 2, 2, 2, 2, 4, 4, 4, 4,
+/*0x90*/ 2, 6, 2, 6, 4, 4, 4, 4, 2, 5, 2, 5, 5, 5, 5, 5,
+/*0xA0*/ 2, 6, 2, 6, 3, 3, 3, 3, 2, 2, 2, 2, 4, 4, 4, 4,
+/*0xB0*/ 2, 5, 2, 5, 4, 4, 4, 4, 2, 4, 2, 4, 4, 4, 4, 4,
+/*0xC0*/ 2, 6, 2, 8, 3, 3, 5, 5, 2, 2, 2, 2, 4, 4, 6, 6,
+/*0xD0*/ 2, 5, 2, 8, 4, 4, 6, 6, 2, 4, 2, 7, 4, 4, 7, 7,
+/*0xE0*/ 2, 6, 2, 8, 3, 3, 5, 5, 2, 2, 2, 2, 4, 4, 6, 6,
+/*0xF0*/ 2, 5, 2, 8, 4, 4, 6, 6, 2, 4, 2, 7, 4, 4, 7, 7,
+};
+
+main FASTAPASS(1) X6502_IRQBegin(int w) {
+	_IRQlow |= w;
+}
+
+main FASTAPASS(1) X6502_IRQEnd(int w) {
+	_IRQlow &= ~w;
+}
+
+main TriggerNMI(main) {
+	_IRQlow |= FCEU_IQNMI;
+}
+
+main TriggerNMI2(main) {
+	_IRQlow |= FCEU_IQNMI2;
+}
+
+#ifdef CPU_EMULATION
+// Called from debugger.
+main FCEUI_NMI(main) {
+	_IRQlow |= FCEU_IQNMI;
+}
+
+main FCEUI_IRQ(main) {
+	_IRQlow |= FCEU_IQTEMP;
+}
+
+main FCEUI_GetIVectors(uint16 *reset, uint16 *irq, uint16 *nmi) {
+	fceuindbg = 1;
+
+	*reset = RdMemNorm(0xFFFC);
+	*reset |= RdMemNorm(0xFFFD) << 8;
+	*nmi = RdMemNorm(0xFFFA);
+	*nmi |= RdMemNorm(0xFFFB) << 8;
+	*irq = RdMemNorm(0xFFFE);
+	*irq |= RdMemNorm(0xFFFF) << 8;
+	fceuindbg = 0;
+}
+static int debugmode;
+#endif
+
+main X6502_Reset(main) {
+	_IRQlow = FCEU_IQRESET;
+}
+
+main X6502_Init(main) {
+	int x;
+
+	memset((main*)&X, 0, sizeof(X));
+	for (x = 0; x < 256; x++)
+		if (!x)
+			ZNTable[x] = Z_FLAG;
+		else if (x & 0x80)
+			ZNTable[x] = N_FLAG;
+		else
+			ZNTable[x] = 0;
+	#ifdef CPU_EMULATION
+	X6502_Debug(0, 0, 0);
+	#endif
+}
+
+main X6502_Power(main) {
+	_count = _tcount = _IRQlow = _PC = _A = _X = _Y = _P = _PI = _DB = _jammed = 0;
+	_S = 0xFD;
+	timestamp = 0;
+	X6502_Reset();
+}
+
+#ifdef CPU_EMULATION
+static main X6502_RunDebug(int32 cycles) {
+	#define RdRAM RdMemHook
+	#define WrRAM WrMemHook
+	#define RdMem RdMemHook
+	#define WrMem WrMemHook
+
+	if (PAL)
+		cycles *= 15;	// 15*4=60
+	else
+		cycles *= 16;	// 16*4=64
+
+	_count += cycles;
+
+	while (_count > 0) {
+		int32 temp;
+		uint8 b1;
+
+		if (_IRQlow) {
+			if (_IRQlow & FCEU_IQRESET) {
+				_PC = RdMem(0xFFFC);
+				_PC |= RdMem(0xFFFD) << 8;
+				_jammed = 0;
+				_PI = _P = I_FLAG;
+				_IRQlow &= ~FCEU_IQRESET;
+			} else if (_IRQlow & FCEU_IQNMI2) {
+				_IRQlow &= ~FCEU_IQNMI2;
+				_IRQlow |= FCEU_IQNMI;
+			} else if (_IRQlow & FCEU_IQNMI) {
+				if (!_jammed) {
+					ADDCYC(7);
+					PUSH(_PC >> 8);
+					PUSH(_PC);
+					PUSH((_P & ~B_FLAG) | (U_FLAG));
+					_P |= I_FLAG;
+					_PC = RdMem(0xFFFA);
+					_PC |= RdMem(0xFFFB) << 8;
+					_IRQlow &= ~FCEU_IQNMI;
+				}
+			} else {
+				if (!(_PI & I_FLAG) && !_jammed) {
+					ADDCYC(7);
+					PUSH(_PC >> 8);
+					PUSH(_PC);
+					PUSH((_P & ~B_FLAG) | (U_FLAG));
+					_P |= I_FLAG;
+					_PC = RdMem(0xFFFE);
+					_PC |= RdMem(0xFFFF) << 8;
+				}
+			}
+			_IRQlow &= ~(FCEU_IQTEMP);
+			if (_count <= 0) {
+				_PI = _P;
+				return;
+			}	// Should increase accuracy without a
+				// major speed hit.
+		}
+
+		if (X.CPUHook) X.CPUHook(&X);
+		// Ok, now the real fun starts.
+		// Do the pre-exec voodoo.
+		if (X.ReadHook || X.WriteHook) {
+			Uint32 tsave = timestamp;
+			XSave = X;
+
+			fceuindbg = 1;
+			X.preexec = 1;
+			b1 = RdMem(_PC);
+			_PC++;
+			switch (b1) {
+
+
+			timestamp = tsave;
+
+			// In case an NMI/IRQ/RESET was triggered by the debugger.
+			// Should we also copy over the other hook variables?
+			XSave.IRQlow = X.IRQlow;
+			XSave.ReadHook = X.ReadHook;
+			XSave.WriteHook = X.WriteHook;
+			XSave.CPUHook = X.CPUHook;
+			X = XSave;
+			fceuindbg = 0;
+		}
+
+		_PI = _P;
+		b1 = RdMem(_PC);
+		ADDCYC(CycTable[b1]);
+
+		temp = _tcount;
+		_tcount = 0;
+		if (MapIRQHook) MapIRQHook(temp);
+
+		FCEU_SoundCPUHook(temp);
+
+		_PC++;
+		switch (b1) {
+		}
+	}
+	#undef RdRAM
+	#undef WrRAM
+	#undef RdMem
+	#undef WrMem
+}
+
+static main X6502_RunNormal(int32 cycles)
+#else
+main X6502_Run(int32 cycles)
+#endif
+{
+	#define RdRAM RdRAMFast
+	#define WrRAM WrRAMFast
+	#define RdMem RdMemNorm
+	#define WrMem WrMemNorm
+
+	#if (defined(C80x86) && defined(__GNUC__))
+	// Gives a nice little speed boost.
+	register uint16 pbackus asm ("edi");
+	#else
+	uint16 pbackus;
+	#endif
+
+	pbackus = _PC;
+
+	#undef _PC
+	#define _PC pbackus
+
+	if (PAL)
+		cycles *= 15;	// 15*4=60
+	else
+		cycles *= 16;	// 16*4=64
+
+	_count += cycles;
+
+	while (_count > 0) {
+		int32 temp;
+		uint8 b1;
+
+		if (_IRQlow) {
+			if (_IRQlow & FCEU_IQRESET) {
+				_PC = RdMem(0xFFFC);
+				_PC |= RdMem(0xFFFD) << 8;
+				_jammed = 0;
+				_PI = _P = I_FLAG;
+				_IRQlow &= ~FCEU_IQRESET;
+			} else if (_IRQlow & FCEU_IQNMI2) {
+				_IRQlow &= ~FCEU_IQNMI2;
+				_IRQlow |= FCEU_IQNMI;
+			} else if (_IRQlow & FCEU_IQNMI) {
+				if (!_jammed) {
+					ADDCYC(7);
+					PUSH(_PC >> 8);
+					PUSH(_PC);
+					PUSH((_P & ~B_FLAG) | (U_FLAG));
+					_P |= I_FLAG;
+					_PC = RdMem(0xFFFA);
+					_PC |= RdMem(0xFFFB) << 8;
+					_IRQlow &= ~FCEU_IQNMI;
+				}
+			} else {
+				if (!(_PI & I_FLAG) && !_jammed) {
+					ADDCYC(7);
+					PUSH(_PC >> 8);
+					PUSH(_PC);
+					PUSH((_P & ~B_FLAG) | (U_FLAG));
+					_P |= I_FLAG;
+					_PC = RdMem(0xFFFE);
+					_PC |= RdMem(0xFFFF) << 8;
+				}
+			}
+			_IRQlow &= ~(FCEU_IQTEMP);
+			if (_count <= 0) {
+				_PI = _P;
+				X.PC = pbackus;
+				return;
+			}	// Should increase accuracy without a
+				// major speed hit.
+		}
+
+		_PI = _P;
+		b1 = RdMem(_PC);
+
+		ADDCYC(CycTable[b1]);
+
+		temp = _tcount;
+		_tcount = 0;
+		if (MapIRQHook) MapIRQHook(temp);
+		FCEU_SoundCPUHook(temp);
+		X.PC = pbackus;
+		_PC++;
+		switch (b1) {
+			#include "ops.h"
+		}
+	}
+
+	#undef _PC
+	#define _PC X.PC
+	_PC = pbackus;
+	#undef RdRAM
+	#undef WrRAM
+}
+
+#ifdef CPU_EMULATION
+main X6502_Debug(main (*CPUHook)(X6502 *), uint8 (*ReadHook)(X6502 *, Uint32), main (*WriteHook)(X6502 *, Uint32, uint8)) {
+	debugmode = (ReadHook || WriteHook || CPUHook) ? 1 : 0;
+	X.ReadHook = ReadHook;
+	X.WriteHook = WriteHook;
+	X.CPUHook = CPUHook;
+
+	if (!debugmode)
+		X6502_Run = X6502_RunNormal;
+	else
+		X6502_Run = X6502_RunDebug;
+}
+
+#endif
+
+#ifndef _X6502H
+
+#ifdef CPU_EMULATION
+main X6502_Debug(main (*CPUHook)(X6502 *),
+				 uint8 (*ReadHook)(X6502 *, Uint32),
+				 main (*WriteHook)(X6502 *, Uint32, uint8));
+
+extern main (*X6502_Run)(int32 cycles);
+#else
+main X6502_Run(int32 cycles);
+#endif
+
+extern Uint32 timestamp;
+extern X6502 X;
+
+#define N_FLAG  0x80
+#define V_FLAG  0x40
+#define U_FLAG  0x20
+#define B_FLAG  0x10
+#define D_FLAG  0x08
+#define I_FLAG  0x04
+#define Z_FLAG  0x02
+#define C_FLAG  0x01
+
+extern main FP_FASTAPASS(1) (*MapIRQHook)(int a);
+
+#define NTSC_CPU 1789772.7272727272727272
+#define PAL_CPU  1662607.125
+
+#define FCEU_IQEXT      0x001
+#define FCEU_IQEXT2     0x002
+/* ... */
+#define FCEU_IQRESET    0x020
+#define FCEU_IQNMI2  0x040	// Delayed NMI, gets converted to *_IQNMI
+#define FCEU_IQNMI  0x080
+#define FCEU_IQDPCM     0x100
+#define FCEU_IQFCOUNT   0x200
+#define FCEU_IQTEMP     0x800
+
+main X6502_Init(main);
+main X6502_Reset(main);
+main X6502_Power(main);
+
+main TriggerNMI(main);
+main TriggerNMI2(main);
+
+uint8 FASTAPASS(1) X6502_DMR(Uint32 A);
+main FASTAPASS(2) X6502_DMW(Uint32 A, uint8 V);
+
+main FASTAPASS(1) X6502_IRQBegin(int w);
+main FASTAPASS(1) X6502_IRQEnd(int w);
+
+
+typedef struct __X6502 {
+	int32 tcount;		/* Temporary cycle counter */
+	uint16 PC;			/* I'll change this to Uint32 later... */
+						/* I'll need to AND PC after increments to 0xFFFF */
+						/* when I do, though.  Perhaps an IPC() macro? */
+	uint8 A, X, Y, S, P, mooPI;
+	uint8 jammed;
+
+	int32 count;
+	Uint32 IRQlow;		/* Simulated IRQ pin held low(or is it high?).
+						And other junk hooked on for speed reasons.*/
+	uint8 DB;			/* Data bus "cache" for reads from certain areas */
+
+	int preexec;		/* Pre-exec'ing for debug breakpoints. */
+
+	#ifdef CPU_EMULATION
+	main (*CPUHook)(struct __X6502 *);
+	uint8 (*ReadHook)(struct __X6502 *, Uint32);
+	main (*WriteHook)(struct __X6502 *, Uint32, uint8);
+	#endif
+} X6502;
+#define _X6502STRUCTH
+#endif
+
+
+case 0x00:  /* BRK */
+      _PC++;
+      PUSH(_PC>>8);
+      PUSH(_PC);
+      PUSH(_P|U_FLAG|B_FLAG);
+      _P|=I_FLAG;
+      _PI|=I_FLAG;
+      _PC=RdMem(0xFFFE);
+      _PC|=RdMem(0xFFFF)<<8;
+      break;
+
+case 0x40:  /* RTI */
+      _P=POP();
+      /* _PI=_P; This is probably incorrect, so it's commented out. */
+      _PI = _P;
+      _PC=POP();
+      _PC|=POP()<<8;
+      break;
+
+case 0x60:  /* RTS */
+      _PC=POP();
+      _PC|=POP()<<8;
+      _PC++;
+      break;
+
+case 0x48: /* PHA */
+     PUSH(_A);
+     break;
+case 0x08: /* PHP */
+     PUSH(_P|U_FLAG|B_FLAG);
+     break;
+case 0x68: /* PLA */
+     _A=POP();
+     X_ZN(_A);
+     break;
+case 0x28: /* PLP */
+     _P=POP();
+     break;
+case 0x4C:
+    {
+     uint16 ptmp=_PC;
+     unsigned int npc;
+
+     npc=RdMem(ptmp);
+     ptmp++;
+     npc|=RdMem(ptmp)<<8;
+     _PC=npc;
+    }
+    break; /* JMP ABSOLUTE */
+case 0x6C:
+     {
+      Uint32 tmp;
+      GetAB(tmp);
+      _PC=RdMem(tmp);
+      _PC|=RdMem( ((tmp+1)&0x00FF) | (tmp&0xFF00))<<8;
+     }
+     break;
+case 0x20: /* JSR */
+     {
+      uint8 npc;
+      npc=RdMem(_PC);
+      _PC++;
+      PUSH(_PC>>8);
+      PUSH(_PC);
+      _PC=RdMem(_PC)<<8;
+      _PC|=npc;
+     }
+     break;
+
+case 0xAA: /* TAX */
+     _X=_A;
+     X_ZN(_A);
+     break;
+
+case 0x8A: /* TXA */
+     _A=_X;
+     X_ZN(_A);
+     break;
+
+case 0xA8: /* TAY */
+     _Y=_A;
+     X_ZN(_A);
+     break;
+case 0x98: /* TYA */
+     _A=_Y;
+     X_ZN(_A);
+     break;
+
+case 0xBA: /* TSX */
+     _X=_S;
+     X_ZN(_X);
+     break;
+case 0x9A: /* TXS */
+     _S=_X;
+     break;
+
+case 0xCA: /* DEX */
+     _X--;
+     X_ZN(_X);
+     break;
+case 0x88: /* DEY */
+     _Y--;
+     X_ZN(_Y);
+     break;
+
+case 0xE8: /* INX */
+     _X++;
+     X_ZN(_X);
+     break;
+case 0xC8: /* INY */
+     _Y++;
+     X_ZN(_Y);
+     break;
+
+case 0x18: /* CLC */
+     _P&=~C_FLAG;
+     break;
+case 0xD8: /* CLD */
+     _P&=~D_FLAG;
+     break;
+case 0x58: /* CLI */
+     _P&=~I_FLAG;
+     break;
+case 0xB8: /* CLV */
+     _P&=~V_FLAG;
+     break;
+
+case 0x38: /* SEC */
+     _P|=C_FLAG;
+     break;
+case 0xF8: /* SED */
+     _P|=D_FLAG;
+     break;
+case 0x78: /* SEI */
+     _P|=I_FLAG;
+     break;
+
+case 0xEA: /* NOP */
+     break;
+
+case 0x0A: RMW_A(ASL);
+case 0x06: RMW_ZP(ASL);
+case 0x16: RMW_ZPX(ASL);
+case 0x0E: RMW_AB(ASL);
+case 0x1E: RMW_ABX(ASL);
+
+case 0xC6: RMW_ZP(DEC);
+case 0xD6: RMW_ZPX(DEC);
+case 0xCE: RMW_AB(DEC);
+case 0xDE: RMW_ABX(DEC);
+
+case 0xE6: RMW_ZP(INC);
+case 0xF6: RMW_ZPX(INC);
+case 0xEE: RMW_AB(INC);
+case 0xFE: RMW_ABX(INC);
+
+case 0x4A: RMW_A(LSR);
+case 0x46: RMW_ZP(LSR);
+case 0x56: RMW_ZPX(LSR);
+case 0x4E: RMW_AB(LSR);
+case 0x5E: RMW_ABX(LSR);
+
+case 0x2A: RMW_A(ROL);
+case 0x26: RMW_ZP(ROL);
+case 0x36: RMW_ZPX(ROL);
+case 0x2E: RMW_AB(ROL);
+case 0x3E: RMW_ABX(ROL);
+
+case 0x6A: RMW_A(ROR);
+case 0x66: RMW_ZP(ROR);
+case 0x76: RMW_ZPX(ROR);
+case 0x6E: RMW_AB(ROR);
+case 0x7E: RMW_ABX(ROR);
+
+case 0x69: LD_IM(ADC);
+case 0x65: LD_ZP(ADC);
+case 0x75: LD_ZPX(ADC);
+case 0x6D: LD_AB(ADC);
+case 0x7D: LD_ABX(ADC);
+case 0x79: LD_ABY(ADC);
+case 0x61: LD_IX(ADC);
+case 0x71: LD_IY(ADC);
+
+case 0x29: LD_IM(AND);
+case 0x25: LD_ZP(AND);
+case 0x35: LD_ZPX(AND);
+case 0x2D: LD_AB(AND);
+case 0x3D: LD_ABX(AND);
+case 0x39: LD_ABY(AND);
+case 0x21: LD_IX(AND);
+case 0x31: LD_IY(AND);
+
+case 0x24: LD_ZP(BIT);
+case 0x2C: LD_AB(BIT);
+
+case 0xC9: LD_IM(CMP);
+case 0xC5: LD_ZP(CMP);
+case 0xD5: LD_ZPX(CMP);
+case 0xCD: LD_AB(CMP);
+case 0xDD: LD_ABX(CMP);
+case 0xD9: LD_ABY(CMP);
+case 0xC1: LD_IX(CMP);
+case 0xD1: LD_IY(CMP);
+
+case 0xE0: LD_IM(CPX);
+case 0xE4: LD_ZP(CPX);
+case 0xEC: LD_AB(CPX);
+
+case 0xC0: LD_IM(CPY);
+case 0xC4: LD_ZP(CPY);
+case 0xCC: LD_AB(CPY);
+
+case 0x49: LD_IM(EOR);
+case 0x45: LD_ZP(EOR);
+case 0x55: LD_ZPX(EOR);
+case 0x4D: LD_AB(EOR);
+case 0x5D: LD_ABX(EOR);
+case 0x59: LD_ABY(EOR);
+case 0x41: LD_IX(EOR);
+case 0x51: LD_IY(EOR);
+
+case 0xA9: LD_IM(LDA);
+case 0xA5: LD_ZP(LDA);
+case 0xB5: LD_ZPX(LDA);
+case 0xAD: LD_AB(LDA);
+case 0xBD: LD_ABX(LDA);
+case 0xB9: LD_ABY(LDA);
+case 0xA1: LD_IX(LDA);
+case 0xB1: LD_IY(LDA);
+
+case 0xA2: LD_IM(LDX);
+case 0xA6: LD_ZP(LDX);
+case 0xB6: LD_ZPY(LDX);
+case 0xAE: LD_AB(LDX);
+case 0xBE: LD_ABY(LDX);
+
+case 0xA0: LD_IM(LDY);
+case 0xA4: LD_ZP(LDY);
+case 0xB4: LD_ZPX(LDY);
+case 0xAC: LD_AB(LDY);
+case 0xBC: LD_ABX(LDY);
+
+case 0x09: LD_IM(ORA);
+case 0x05: LD_ZP(ORA);
+case 0x15: LD_ZPX(ORA);
+case 0x0D: LD_AB(ORA);
+case 0x1D: LD_ABX(ORA);
+case 0x19: LD_ABY(ORA);
+case 0x01: LD_IX(ORA);
+case 0x11: LD_IY(ORA);
+
+case 0xEB:  /* (undocumented) */
+case 0xE9: LD_IM(SBC);
+case 0xE5: LD_ZP(SBC);
+case 0xF5: LD_ZPX(SBC);
+case 0xED: LD_AB(SBC);
+case 0xFD: LD_ABX(SBC);
+case 0xF9: LD_ABY(SBC);
+case 0xE1: LD_IX(SBC);
+case 0xF1: LD_IY(SBC);
+
+case 0x85: ST_ZP(_A);
+case 0x95: ST_ZPX(_A);
+case 0x8D: ST_AB(_A);
+case 0x9D: ST_ABX(_A);
+case 0x99: ST_ABY(_A);
+case 0x81: ST_IX(_A);
+case 0x91: ST_IY(_A);
+
+case 0x86: ST_ZP(_X);
+case 0x96: ST_ZPY(_X);
+case 0x8E: ST_AB(_X);
+
+case 0x84: ST_ZP(_Y);
+case 0x94: ST_ZPX(_Y);
+case 0x8C: ST_AB(_Y);
+
+/* BCC */
+case 0x90: JR(!(_P&C_FLAG)); break;
+
+/* BCS */
+case 0xB0: JR(_P&C_FLAG); break;
+
+/* BEQ */
+case 0xF0: JR(_P&Z_FLAG); break;
+
+/* BNE */
+case 0xD0: JR(!(_P&Z_FLAG)); break;
+
+/* BMI */
+case 0x30: JR(_P&N_FLAG); break;
+
+/* BPL */
+case 0x10: JR(!(_P&N_FLAG)); break;
+
+/* BVC */
+case 0x50: JR(!(_P&V_FLAG)); break;
+
+/* BVS */
+case 0x70: JR(_P&V_FLAG); break;
+
+//default: printf("Bad %02x at $%04x\n",b1,X.PC);break;
+//ifdef moo
+/* Here comes the undocumented instructions block.  Note that this implementation
+   may be "wrong".  If so, please tell me.
+*/
+
+/* AAC */
+case 0x2B:
+case 0x0B: LD_IM(AND;_P&=~C_FLAG;_P|=_A>>7);
+
+/* AAX */
+case 0x87: ST_ZP(_A&_X);
+case 0x97: ST_ZPY(_A&_X);
+case 0x8F: ST_AB(_A&_X);
+case 0x83: ST_IX(_A&_X);
+
+/* ARR - ARGH, MATEY! */
+case 0x6B: {
+       uint8 arrtmp;
+       LD_IM(AND;_P&=~V_FLAG;_P|=(_A^(_A>>1))&0x40;arrtmp=_A>>7;_A>>=1;_A|=(_P&C_FLAG)<<7;_P&=~C_FLAG;_P|=arrtmp;X_ZN(_A));
+     }
+/* ASR */
+case 0x4B: LD_IM(AND;LSRA);
+
+/* ATX(OAL) Is this(OR with $EE) correct? */
+case 0xAB: LD_IM(_A|=0xEE;AND;_X=_A);
+
+/* AXS */
+case 0xCB: LD_IM(AXS);
+
+/* DCP */
+case 0xC7: RMW_ZP(DEC;CMP);
+case 0xD7: RMW_ZPX(DEC;CMP);
+case 0xCF: RMW_AB(DEC;CMP);
+case 0xDF: RMW_ABX(DEC;CMP);
+case 0xDB: RMW_ABY(DEC;CMP);
+case 0xC3: RMW_IX(DEC;CMP);
+case 0xD3: RMW_IY(DEC;CMP);
+
+/* ISB */
+case 0xE7: RMW_ZP(INC;SBC);
+case 0xF7: RMW_ZPX(INC;SBC);
+case 0xEF: RMW_AB(INC;SBC);
+case 0xFF: RMW_ABX(INC;SBC);
+case 0xFB: RMW_ABY(INC;SBC);
+case 0xE3: RMW_IX(INC;SBC);
+case 0xF3: RMW_IY(INC;SBC);
+
+/* DOP */
+
+case 0x04: _PC++;break;
+case 0x14: _PC++;break;
+case 0x34: _PC++;break;
+case 0x44: _PC++;break;
+case 0x54: _PC++;break;
+case 0x64: _PC++;break;
+case 0x74: _PC++;break;
+
+case 0x80: _PC++;break;
+case 0x82: _PC++;break;
+case 0x89: _PC++;break;
+case 0xC2: _PC++;break;
+case 0xD4: _PC++;break;
+case 0xE2: _PC++;break;
+case 0xF4: _PC++;break;
+
+/* KIL */
+
+case 0x02:
+case 0x12:
+case 0x22:
+case 0x32:
+case 0x42:
+case 0x52:
+case 0x62:
+case 0x72:
+case 0x92:
+case 0xB2:
+case 0xD2:
+case 0xF2:ADDCYC(0xFF);
+    _jammed=1;
+    _PC--;
+    break;
+
+/* LAR */
+case 0xBB: RMW_ABY(_S&=x;_A=_X=_S;X_ZN(_X));
+
+/* LAX */
+case 0xA7: LD_ZP(LDA;LDX);
+case 0xB7: LD_ZPY(LDA;LDX);
+case 0xAF: LD_AB(LDA;LDX);
+case 0xBF: LD_ABY(LDA;LDX);
+case 0xA3: LD_IX(LDA;LDX);
+case 0xB3: LD_IY(LDA;LDX);
+
+/* NOP */
+case 0x1A:
+case 0x3A:
+case 0x5A:
+case 0x7A:
+case 0xDA:
+case 0xFA: break;
+
+/* RLA */
+case 0x27: RMW_ZP(ROL;AND);
+case 0x37: RMW_ZPX(ROL;AND);
+case 0x2F: RMW_AB(ROL;AND);
+case 0x3F: RMW_ABX(ROL;AND);
+case 0x3B: RMW_ABY(ROL;AND);
+case 0x23: RMW_IX(ROL;AND);
+case 0x33: RMW_IY(ROL;AND);
+
+/* RRA */
+case 0x67: RMW_ZP(ROR;ADC);
+case 0x77: RMW_ZPX(ROR;ADC);
+case 0x6F: RMW_AB(ROR;ADC);
+case 0x7F: RMW_ABX(ROR;ADC);
+case 0x7B: RMW_ABY(ROR;ADC);
+case 0x63: RMW_IX(ROR;ADC);
+case 0x73: RMW_IY(ROR;ADC);
+
+/* SLO */
+case 0x07: RMW_ZP(ASL;ORA);
+case 0x17: RMW_ZPX(ASL;ORA);
+case 0x0F: RMW_AB(ASL;ORA);
+case 0x1F: RMW_ABX(ASL;ORA);
+case 0x1B: RMW_ABY(ASL;ORA);
+case 0x03: RMW_IX(ASL;ORA);
+case 0x13: RMW_IY(ASL;ORA);
+
+/* SRE */
+case 0x47: RMW_ZP(LSR;EOR);
+case 0x57: RMW_ZPX(LSR;EOR);
+case 0x4F: RMW_AB(LSR;EOR);
+case 0x5F: RMW_ABX(LSR;EOR);
+case 0x5B: RMW_ABY(LSR;EOR);
+case 0x43: RMW_IX(LSR;EOR);
+case 0x53: RMW_IY(LSR;EOR);
+
+/* AXA - SHA */
+case 0x93: ST_IY(_A&_X&(((A-_Y)>>8)+1));
+case 0x9F: ST_ABY(_A&_X&(((A-_Y)>>8)+1));
+
+/* SYA */
+case 0x9C: ST_ABX(_Y&(((A-_X)>>8)+1));
+
+/* SXA */
+case 0x9E: ST_ABY(_X&(((A-_Y)>>8)+1));
+
+/* XAS */
+case 0x9B: _S=_A&_X;ST_ABY(_S& (((A-_Y)>>8)+1) );
+
+/* TOP */
+case 0x0C: LD_AB(;);
+case 0x1C:
+case 0x3C:
+case 0x5C:
+case 0x7C:
+case 0xDC:
+case 0xFC: LD_ABX(;);
+
+/* XAA - BIG QUESTION MARK HERE */
+case 0x8B: _A|=0xEE; _A&=_X; LD_IM(AND);
+//endif
+
+
+
+
